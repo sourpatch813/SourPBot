@@ -20,7 +20,7 @@ async function postGoLiveEmbed({ title, game, thumbnailUrl, streamUrl, viewerCou
 
   const embed = new EmbedBuilder()
     .setColor(0x6BDD00) // Sour_Patch bright green
-    .setTitle(`⚡ SOUR_PATCH_ IS LIVE — LET'S GET IT! 🔥`)
+    .setTitle(`⚡ SOUR\_PATCH\_ IS LIVE — LET'S GET IT! 🔥`)
     .setURL(streamUrl)
     .setDescription(`> 🎮 **${title}**\n> Drop in, lurk, chat — you already know the vibe.`)
     .addFields(
@@ -33,7 +33,7 @@ async function postGoLiveEmbed({ title, game, thumbnailUrl, streamUrl, viewerCou
     .setFooter({ text: '🟢 Stream just went live • Twitch' });
 
   await channel.send({
-    content: `${pingText}🚨 **SOUR_PATCH_ JUST WENT LIVE!** Don't sleep on it 👀`,
+    content: `${pingText}🚨 **SOUR\_PATCH\_ JUST WENT LIVE!** Don't sleep on it 👀`,
     embeds: [embed]
   });
   console.log('📢 Go-live embed posted.');
