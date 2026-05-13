@@ -7,6 +7,7 @@ const session = {
   streamStartTime: null,
   peakViewers: 0,
   redeemCounts: {},
+  lastOnlineEvent: 0,
 };
 
 let appAccessToken = null;
