@@ -64,7 +64,7 @@ async function postStreamSummary({ duration, topRedeems, peakViewers }) {
       { name: '🎯 Top Redeems', value: redeemsText }
     )
     .setTimestamp()
-    .setFooter({ text: 'SOUR_PATCH_ • Stream Summary' });
+    .setFooter({ text: 'SOUR\_PATCH\_ • Stream Summary' });
 
   await channel.send({ embeds: [embed] });
   console.log('📋 Stream summary posted.');
@@ -83,7 +83,7 @@ async function postRedeemEmbed({ userName, rewardTitle, userInput }) {
       { name: '👤 User', value: userName, inline: true }
     )
     .setTimestamp()
-    .setFooter({ text: 'SOUR_PATCH_ • Channel Points' });
+    .setFooter({ text: 'SOUR\_PATCH\_ • Channel Points' });
 
   if (userInput) {
     embed.addFields({ name: '💬 Message', value: userInput });
