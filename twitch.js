@@ -1,93 +1,215 @@
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const express = require('express');
+const crypto = require('crypto');
+const axios = require('axios');
+const { postGoLiveEmbed, postStreamSummary, postRedeemEmbed } = require('./discord');
 
-let discordClient = null;
+const session = {
+  streamStartTime: null,
+  peakViewers: 0,
+  redeemCounts: {},
+};
 
-async function startDiscordBot() {
-  discordClient = new Client({ intents: [GatewayIntentBits.Guilds] });
+let appAccessToken = null;
+let userAccessToken = null;
 
-  discordClient.once('ready', () => {
-    console.log(`✅ Discord ready as ${discordClient.user.tag}`);
+async function getTwitchToken() {
+  const res = await axios.post('https://id.twitch.tv/oauth2/token', null, {
+    params: {
+      client_id: process.env.TWITCH_CLIENT_ID,
+      client_secret: process.env.TWITCH_CLIENT_SECRET,
+      grant_type: 'client_credentials',
+    },
+  });
+  appAccessToken = res.data.access_token;
+  console.log('🔑 Twitch app token obtained.');
+  return appAccessToken;
+}
+
+async function exchangeCodeForToken(code) {
+  const res = await axios.post('https://id.twitch.tv/oauth2/token', null, {
+    params: {
+      client_id: process.env.TWITCH_CLIENT_ID,
+      client_secret: process.env.TWITCH_CLIENT_SECRET,
+      code,
+      grant_type: 'authorization_code',
+      redirect_uri: process.env.EVENTSUB_CALLBACK_URL + '/auth/callback',
+    },
+  });
+  userAccessToken = res.data.access_token;
+  console.log('✅ User access token obtained! Channel Points now authorized.');
+  return userAccessToken;
+}
+
+async function fetchStreamInfo() {
+  const res = await axios.get('https://api.twitch.tv/helix/streams', {
+    params: { user_id: process.env.TWITCH_BROADCASTER_ID },
+    headers: {
+      'Client-ID': process.env.TWITCH_CLIENT_ID,
+      Authorization: `Bearer ${appAccessToken}`,
+    },
+  });
+  return res.data.data[0] || null;
+}
+
+async function registerSubscriptions() {
+  const callbackUrl = process.env.EVENTSUB_CALLBACK_URL + '/eventsub';
+  const secret = process.env.EVENTSUB_SECRET;
+  const broadcasterId = process.env.TWITCH_BROADCASTER_ID;
+
+  const subscriptions = [
+    { type: 'stream.online', version: '1', condition: { broadcaster_user_id: broadcasterId }, token: appAccessToken },
+    { type: 'stream.offline', version: '1', condition: { broadcaster_user_id: broadcasterId }, token: appAccessToken },
+    {
+      type: 'channel.channel_points_custom_reward_redemption.add',
+      version: '1',
+      condition: { broadcaster_user_id: broadcasterId },
+      token: userAccessToken || appAccessToken,
+    },
+  ];
+
+  for (const sub of subscriptions) {
+    try {
+      await axios.post(
+        'https://api.twitch.tv/helix/eventsub/subscriptions',
+        { type: sub.type, version: sub.version, condition: sub.condition, transport: { method: 'webhook', callback: callbackUrl, secret } },
+        {
+          headers: {
+            'Client-ID': process.env.TWITCH_CLIENT_ID,
+            Authorization: `Bearer ${sub.token}`,
+            'Content-Type': 'application/json',
+          },
+        }
+      );
+      console.log(`✅ Subscribed to ${sub.type}`);
+    } catch (err) {
+      if (err.response?.status === 409) {
+        console.log(`ℹ️  Already subscribed to ${sub.type}`);
+      } else {
+        console.warn(`⚠️  Could not subscribe to ${sub.type}:`, err.response?.data?.message || err.message);
+      }
+    }
+  }
+}
+
+function verifySignature(req) {
+  const msgId = req.headers['twitch-eventsub-message-id'];
+  const timestamp = req.headers['twitch-eventsub-message-timestamp'];
+  const signature = req.headers['twitch-eventsub-message-signature'];
+  const body = req.rawBody;
+  const hmac = 'sha256=' + crypto
+    .createHmac('sha256', process.env.EVENTSUB_SECRET)
+    .update(msgId + timestamp + body)
+    .digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(signature));
+}
+
+async function handleStreamOnline() {
+  session.streamStartTime = Date.now();
+  session.peakViewers = 0;
+  session.redeemCounts = {};
+  await new Promise(r => setTimeout(r, 5000));
+  const streamInfo = await fetchStreamInfo();
+  if (!streamInfo) return;
+  const streamUrl = `https://twitch.tv/${process.env.TWITCH_CHANNEL_NAME}`;
+  await postGoLiveEmbed({
+    title: streamInfo.title,
+    game: streamInfo.game_name,
+    thumbnailUrl: streamInfo.thumbnail_url,
+    streamUrl,
+    viewerCount: streamInfo.viewer_count,
+  });
+  session.peakViewers = streamInfo.viewer_count || 0;
+  const viewerPoll = setInterval(async () => {
+    try {
+      const info = await fetchStreamInfo();
+      if (info && info.viewer_count > session.peakViewers) {
+        session.peakViewers = info.viewer_count;
+      }
+    } catch {}
+  }, 5 * 60 * 1000);
+  session.viewerPoll = viewerPoll;
+}
+
+async function handleStreamOffline() {
+  if (session.viewerPoll) clearInterval(session.viewerPoll);
+  const duration = session.streamStartTime ? Date.now() - session.streamStartTime : 0;
+  const topRedeems = Object.entries(session.redeemCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([title, count]) => ({ title, count }));
+  await postStreamSummary({ duration, topRedeems, peakViewers: session.peakViewers });
+  session.streamStartTime = null;
+}
+
+async function handleRedeem(event) {
+  const { user_name, reward, user_input } = event;
+  const rewardTitle = reward.title;
+  session.redeemCounts[rewardTitle] = (session.redeemCounts[rewardTitle] || 0) + 1;
+  await postRedeemEmbed({
+    userName: user_name,
+    rewardTitle,
+    userInput: user_input || null,
+  });
+}
+
+async function startTwitchListener(discordClient) {
+  await getTwitchToken();
+
+  const app = express();
+  app.use(express.json({
+    verify: (req, res, buf) => { req.rawBody = buf.toString(); }
+  }));
+
+  app.get('/auth/callback', async (req, res) => {
+    const code = req.query.code;
+    if (!code) return res.status(400).send('Missing code');
+    try {
+      await exchangeCodeForToken(code);
+      await registerSubscriptions();
+      res.send('✅ Authorization successful! Channel Points redeems are now active. You can close this tab.');
+    } catch (err) {
+      console.error('Auth callback error:', err.message);
+      res.status(500).send('Authorization failed. Check logs.');
+    }
   });
 
-  await discordClient.login(process.env.DISCORD_BOT_TOKEN);
-  return discordClient;
+  app.post('/eventsub', async (req, res) => {
+    try {
+      if (!verifySignature(req)) {
+        console.warn('⚠️  Invalid signature from Twitch');
+        return res.status(403).send('Forbidden');
+      }
+    } catch {
+      return res.status(403).send('Forbidden');
+    }
+
+    const messageType = req.headers['twitch-eventsub-message-type'];
+
+    if (messageType === 'webhook_callback_verification') {
+      console.log('🤝 Twitch webhook verified!');
+      return res.status(200).send(req.body.challenge);
+    }
+    if (messageType === 'revocation') {
+      console.warn('⚠️  Subscription revoked:', req.body.subscription.type);
+      return res.sendStatus(204);
+    }
+    if (messageType === 'notification') {
+      const { type } = req.body.subscription;
+      const event = req.body.event;
+      console.log(`📨 Event received: ${type}`);
+      if (type === 'stream.online') await handleStreamOnline();
+      else if (type === 'stream.offline') await handleStreamOffline();
+      else if (type === 'channel.channel_points_custom_reward_redemption.add') await handleRedeem(event);
+    }
+    res.sendStatus(204);
+  });
+
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => {
+    console.log(`🌐 EventSub webhook listening on port ${port}`);
+  });
+
+  await registerSubscriptions();
 }
 
-// ─── GO LIVE EMBED ────────────────────────────────────────
-async function postGoLiveEmbed({ title, game, thumbnailUrl, streamUrl, viewerCount }) {
-  const channel = await discordClient.channels.fetch(process.env.DISCORD_LIVE_CHANNEL_ID);
-  if (!channel) return;
-
-  const pingRole = process.env.DISCORD_PING_ROLE_ID;
-  const pingText = pingRole ? `<@&${pingRole}> ` : '';
-
-  const embed = new EmbedBuilder()
-    .setColor(0x9146FF) // Twitch purple
-    .setTitle(`🟣 ${process.env.TWITCH_CHANNEL_NAME} is LIVE`)
-    .setURL(streamUrl)
-    .setDescription(`**${title}**`)
-    .addFields(
-      { name: '🎮 Game', value: game || 'Unknown', inline: true },
-      { name: '👁️ Viewers', value: String(viewerCount ?? 0), inline: true }
-    )
-    .setImage(thumbnailUrl ? thumbnailUrl.replace('{width}', '1280').replace('{height}', '720') : null)
-    .setTimestamp()
-    .setFooter({ text: 'Twitch • Go watch live!' });
-
-  await channel.send({ content: `${pingText}🔴 Stream is live!`, embeds: [embed] });
-  console.log('📢 Go-live embed posted.');
-}
-
-// ─── STREAM ENDED / SUMMARY EMBED ────────────────────────
-async function postStreamSummary({ duration, topRedeems, peakViewers }) {
-  const channel = await discordClient.channels.fetch(process.env.DISCORD_LIVE_CHANNEL_ID);
-  if (!channel) return;
-
-  const formatDuration = (ms) => {
-    const totalMinutes = Math.floor(ms / 60000);
-    const h = Math.floor(totalMinutes / 60);
-    const m = totalMinutes % 60;
-    return h > 0 ? `${h}h ${m}m` : `${m}m`;
-  };
-
-  const redeemsText = topRedeems && topRedeems.length > 0
-    ? topRedeems.map(r => `• **${r.title}** — ${r.count}x`).join('\n')
-    : 'No redeems this session.';
-
-  const embed = new EmbedBuilder()
-    .setColor(0x444444)
-    .setTitle(`⬛ Stream Over — Thanks for watching!`)
-    .addFields(
-      { name: '⏱️ Duration', value: formatDuration(duration), inline: true },
-      { name: '📈 Peak Viewers', value: String(peakViewers ?? '—'), inline: true },
-      { name: '🎯 Top Channel Point Redeems', value: redeemsText }
-    )
-    .setTimestamp()
-    .setFooter({ text: 'See you next time!' });
-
-  await channel.send({ embeds: [embed] });
-  console.log('📋 Stream summary posted.');
-}
-
-// ─── CHANNEL POINTS REDEEM EMBED ─────────────────────────
-async function postRedeemEmbed({ userName, rewardTitle, userInput }) {
-  const channel = await discordClient.channels.fetch(process.env.DISCORD_REDEEMS_CHANNEL_ID);
-  if (!channel) return;
-
-  const embed = new EmbedBuilder()
-    .setColor(0xF0A000)
-    .setTitle('🎯 Channel Points Redeemed')
-    .addFields(
-      { name: '👤 User', value: userName, inline: true },
-      { name: '🏆 Reward', value: rewardTitle, inline: true }
-    )
-    .setTimestamp();
-
-  if (userInput) {
-    embed.addFields({ name: '💬 Message', value: userInput });
-  }
-
-  await channel.send({ embeds: [embed] });
-}
-
-module.exports = { startDiscordBot, postGoLiveEmbed, postStreamSummary, postRedeemEmbed };
+module.exports = { startTwitchListener };
