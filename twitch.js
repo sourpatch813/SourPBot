@@ -105,7 +105,13 @@ function verifySignature(req) {
 }
 
 async function handleStreamOnline() {
-  session.streamStartTime = Date.now();
+  const now = Date.now();
+  if (now - session.lastOnlineEvent < 60000) {
+    console.log('⚠️ Duplicate stream.online event ignored.');
+    return;
+  }
+  session.lastOnlineEvent = now;
+  session.streamStartTime = now;
   session.peakViewers = 0;
   session.redeemCounts = {};
   await new Promise(r => setTimeout(r, 5000));
